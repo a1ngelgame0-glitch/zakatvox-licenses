@@ -27,11 +27,15 @@ ALLOWED_USERS = {
 TZ = ZoneInfo(os.environ.get("TZ_NAME", "Europe/Moscow"))
 CURRENCY = os.environ.get("CURRENCY", "₽")
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-# gemini-flash-latest — псевдоним Google, всегда указывает на свежую Flash-модель (есть в бесплатном тарифе).
-CHAT_MODEL = os.environ.get("CHAT_MODEL", "gemini-flash-latest")
-# Модель для отчётов и планов; по умолчанию та же, можно поставить помощнее, если позволяет тариф.
-SMART_MODEL = os.environ.get("SMART_MODEL", CHAT_MODEL)
+# Ключ авторизации из личного кабинета developers.sber.ru (строка base64).
+GIGACHAT_CREDENTIALS = os.environ.get("GIGACHAT_CREDENTIALS", "")
+# GIGACHAT_API_PERS — для физлиц (бесплатный пакет токенов).
+GIGACHAT_SCOPE = os.environ.get("GIGACHAT_SCOPE", "GIGACHAT_API_PERS")
+# Корневой сертификат Минцифры: без него не проверить защищённое соединение с GigaChat.
+GIGACHAT_CA_BUNDLE = Path(os.environ.get("GIGACHAT_CA_BUNDLE", BASE_DIR / "russian_trusted_root_ca.pem"))
+# Модель для повседневного общения и модель для отчётов, планов и чеков (умеет читать фото).
+CHAT_MODEL = os.environ.get("CHAT_MODEL", "GigaChat")
+SMART_MODEL = os.environ.get("SMART_MODEL", "GigaChat-Max")
 
 DB_PATH = Path(os.environ.get("DB_PATH", BASE_DIR / "assistant.db"))
 

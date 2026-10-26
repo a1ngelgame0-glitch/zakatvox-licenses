@@ -10,7 +10,7 @@ from aiogram.utils.chat_action import ChatActionSender
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 import ai
-from config import ALLOWED_USERS, CURRENCY, GEMINI_API_KEY, TELEGRAM_TOKEN
+from config import ALLOWED_USERS, CHAT_MODEL, CURRENCY, GIGACHAT_CA_BUNDLE, GIGACHAT_CREDENTIALS, SMART_MODEL, TELEGRAM_TOKEN
 from db import DB
 from timeutil import local_now, month_range, next_occurrence, prev_month, utc_iso_to_local
 from tools import budget_warning, goal_view
@@ -304,8 +304,17 @@ async def tick(bot: Bot) -> None:
 async def main() -> None:
     if not TELEGRAM_TOKEN:
         raise SystemExit("Не задан TELEGRAM_TOKEN — смотри README.md")
-    if not GEMINI_API_KEY:
-        raise SystemExit("Не задан GEMINI_API_KEY — смотри README.md")
+    if not GIGACHAT_CREDENTIALS:
+        raise SystemExit("Не задан GIGACHAT_CREDENTIALS — смотри README.md")
+    if not GIGACHAT_CA_BUNDLE.exists():
+        raise SystemExit(f"Нет сертификата Минцифры {GIGACHAT_CA_BUNDLE.name} — смотри README.md")
+    try:
+        models = [m.id_ for m in (await ai.client.aget_models()).data]
+        log.info("Модели GigaChat, доступные по ключу: %s", ", ".join(models))
+        for name in {CHAT_MODEL, SMART_MODEL} - set(models):
+            log.warning("Модели %s нет в списке — поменяй CHAT_MODEL/SMART_MODEL в .env", name)
+    except ai.AIError as e:
+        raise SystemExit(f"Не получилось подключиться к GigaChat: {ai.error_text(e)}")
     bot = Bot(TELEGRAM_TOKEN)
     await bot.set_my_commands(
         [
