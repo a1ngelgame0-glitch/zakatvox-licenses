@@ -27,9 +27,11 @@ ALLOWED_USERS = {
 TZ = ZoneInfo(os.environ.get("TZ_NAME", "Europe/Moscow"))
 CURRENCY = os.environ.get("CURRENCY", "₽")
 
-# Дешёвая модель для повседневного общения и мощная — для отчётов и планов.
-CHAT_MODEL = os.environ.get("CHAT_MODEL", "claude-haiku-5-5")
-SMART_MODEL = os.environ.get("SMART_MODEL", "claude-opus-5-5")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+# gemini-flash-latest — псевдоним Google, всегда указывает на свежую Flash-модель (есть в бесплатном тарифе).
+CHAT_MODEL = os.environ.get("CHAT_MODEL", "gemini-flash-latest")
+# Модель для отчётов и планов; по умолчанию та же, можно поставить помощнее, если позволяет тариф.
+SMART_MODEL = os.environ.get("SMART_MODEL", CHAT_MODEL)
 
 DB_PATH = Path(os.environ.get("DB_PATH", BASE_DIR / "assistant.db"))
 

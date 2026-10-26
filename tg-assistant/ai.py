@@ -1,25 +1,27 @@
-"""Всё общение с Claude: чат с инструментами, отчёты, планы и распознавание чеков."""
+"""Всё общение с Gemini: чат с инструментами, отчёты, планы и распознавание чеков."""
 
-import base64
 import json
 import logging
 from datetime import date
 from typing import Literal, Optional
 
-import anthropic
+from google import genai
+from google.genai import errors, types
 from pydantic import BaseModel
 
-from config import CATEGORIES, CHAT_MODEL, CURRENCY, HISTORY_LIMIT, SMART_MODEL
+from config import CATEGORIES, CHAT_MODEL, CURRENCY, GEMINI_API_KEY, HISTORY_LIMIT, SMART_MODEL
 from db import DB
 from timeutil import local_now, month_range, prev_month, stamp
 from tools import TOOLS, ToolError, goal_view, run_tool
 
 log = logging.getLogger(__name__)
-client = anthropic.AsyncAnthropic()
+# Без ключа бот всё равно запустится и подскажет, что ключ не задан.
+client = genai.Client(api_key=GEMINI_API_KEY or "missing")
 
+AIError = errors.APIError
 MAX_TOOL_STEPS = 8
 
-# Системный промпт не меняется между запросами — так работает кэш и история остаётся валидной.
+# Системный промпт не меняется между запросами.
 # Всё, что меняется (дата, заметки, резюме), приходит внутри сообщений пользователя.
 SYSTEM = f"""Ты — личный ИИ-помощник пользователя в Telegram. Общаешься по-русски, на «ты», \
 дружелюбно и по делу, как умный друг, который помогает с деньгами, целями и делами.
@@ -42,13 +44,55 @@ SYSTEM = f"""Ты — личный ИИ-помощник пользовател�
 - Для подробного отчёта за месяц предлагай команду /report, для пошагового плана по цели — /plan.
 - Не выдумывай данные: если нужны цифры, сначала получи их инструментом."""
 
+GEMINI_TOOLS = [
+    types.Tool(
+        function_declarations=[
+            types.FunctionDeclaration(
+                name=t["name"], description=t["description"], parameters_json_schema=t["input_schema"]
+            )
+            for t in TOOLS
+        ]
+    )
+]
+NO_AFC = types.AutomaticFunctionCallingConfig(disable=True)
 
-def _blocks_to_json(content) -> list[dict]:
-    return [block.model_dump(mode="json", exclude_none=True) for block in content]
+
+def error_text(error: Exception) -> str:
+    code = getattr(error, "code", None)
+    if code == 429:
+        return "Упёрлись в лимит бесплатного Gemini ⏳ Подожди минутку (или до завтра, если кончился дневной лимит)."
+    if code in (400, 401, 403) and "key" in str(error).lower():
+        return "Не могу достучаться до Gemini: проверь GEMINI_API_KEY в .env 🔑"
+    if isinstance(error, errors.ServerError):
+        return "Gemini сейчас барахлит, попробуй чуть позже 🛠"
+    return "Что-то пошло не так 😵 Попробуй ещё раз."
 
 
-def _text_of(content) -> str:
-    return "\n".join(b.text for b in content if b.type == "text").strip()
+def _content_of(response: types.GenerateContentResponse) -> types.Content | None:
+    """Ответ модели, или None, если ответ заблокирован или пустой."""
+    if not response.candidates or not response.candidates[0].content:
+        return None
+    content = response.candidates[0].content
+    return content if content.parts else None
+
+
+def _text_of(content: types.Content | None) -> str:
+    if not content or not content.parts:
+        return ""
+    return "\n".join(p.text for p in content.parts if p.text and not p.thought).strip()
+
+
+def _dump(content: types.Content) -> dict:
+    data = content.model_dump(mode="json", exclude_none=True)
+    return {"role": data["role"], "content": data["parts"]}
+
+
+def _load(history: list[dict]) -> list[types.Content]:
+    return [types.Content.model_validate({"role": m["role"], "parts": m["content"]}) for m in history]
+
+
+def _user(text: str) -> types.Content:
+    return types.Content(role="user", parts=[types.Part(text=text)])
 
 
 def _context_header(db: DB, user_id: int, fresh: bool) -> str:
@@ -80,19 +124,20 @@ async def _compact_if_needed(db: DB, user_id: int, history: list[dict]) -> list[
     if old_summary:
         request += f"\nВключи важное из прошлого резюме:\n{old_summary}"
     try:
-        response = await client.messages.create(
+        response = await client.aio.models.generate_content(
             model=CHAT_MODEL,
-            max_tokens=4000,
-            system=SYSTEM,
-            tools=TOOLS,
-            tool_choice={"type": "none"},
-            output_config={"effort": "low"},
-            messages=history + [{"role": "user", "content": request}],
+            contents=_load(history) + [_user(request)],
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM,
+                tools=GEMINI_TOOLS,
+                tool_config=types.ToolConfig(function_calling_config=types.FunctionCallingConfig(mode="NONE")),
+                automatic_function_calling=NO_AFC,
+            ),
         )
-    except anthropic.APIError:
+    except AIError:
         log.exception("Не удалось сжать историю, оставляю как есть")
         return history
-    summary = _text_of(response.content)
+    summary = _text_of(_content_of(response))
     if not summary:
         return history
     db.set_user_field(user_id, "summary", summary)
@@ -103,65 +148,63 @@ async def _compact_if_needed(db: DB, user_id: int, history: list[dict]) -> list[
 async def chat(db: DB, user_id: int, text: str) -> str:
     history = await _compact_if_needed(db, user_id, db.load_history(user_id))
     header = _context_header(db, user_id, fresh=not history)
-    new_messages: list[dict] = [{"role": "user", "content": f"{header}\n{text}"}]
+    contents = _load(history)
+    new_messages: list[types.Content] = [_user(f"{header}\n{text}")]
+    content = None
 
     for step in range(MAX_TOOL_STEPS + 1):
-        extra = {"tool_choice": {"type": "none"}} if step == MAX_TOOL_STEPS else {}
-        response = await client.messages.create(
+        mode = "NONE" if step == MAX_TOOL_STEPS else "AUTO"
+        response = await client.aio.models.generate_content(
             model=CHAT_MODEL,
-            max_tokens=8000,
-            system=SYSTEM,
-            tools=TOOLS,
-            cache_control={"type": "ephemeral"},
-            output_config={"effort": "low"},
-            messages=history + new_messages,
-            **extra,
+            contents=contents + new_messages,
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM,
+                tools=GEMINI_TOOLS,
+                tool_config=types.ToolConfig(function_calling_config=types.FunctionCallingConfig(mode=mode)),
+                automatic_function_calling=NO_AFC,
+            ),
         )
-
-        if response.stop_reason == "refusal":
+        content = _content_of(response)
+        if content is None:
             # Ход не сохраняем, чтобы в истории не осталось оборванного запроса.
             return "Извини, с этим я помочь не могу 🙏"
 
-        new_messages.append({"role": "assistant", "content": _blocks_to_json(response.content)})
-        tool_calls = [b for b in response.content if b.type == "tool_use"]
-        if not tool_calls:
+        new_messages.append(content)
+        calls = [p.function_call for p in content.parts if p.function_call]
+        if not calls:
             break
 
         results = []
-        for call in tool_calls:
+        for call in calls:
             try:
-                output = run_tool(db, user_id, call.name, call.input)
-                results.append({"type": "tool_result", "tool_use_id": call.id, "content": output})
+                result = {"result": json.loads(run_tool(db, user_id, call.name, dict(call.args or {})))}
             except (ToolError, KeyError, ValueError, TypeError) as e:
-                results.append(
-                    {"type": "tool_result", "tool_use_id": call.id, "content": f"Ошибка: {e}", "is_error": True}
-                )
-        new_messages.append({"role": "user", "content": results})
+                result = {"error": str(e)}
+            results.append(
+                types.Part(function_response=types.FunctionResponse(id=call.id, name=call.name, response=result))
+            )
+        new_messages.append(types.Content(role="user", parts=results))
 
-    db.append_history(user_id, new_messages)
-    return _text_of(response.content) or "👌"
+    db.append_history(user_id, [_dump(m) for m in new_messages])
+    return _text_of(content) or "👌"
 
 
-# --- «Умные» задачи на мощной модели ---
+# --- «Умные» задачи: отчёт, план, чекин ---
 
 
 async def _smart(prompt: str) -> str:
-    response = await client.beta.messages.create(
+    response = await client.aio.models.generate_content(
         model=SMART_MODEL,
-        max_tokens=16000,
-        betas=["server-side-fallback-2026-07-01"],
-        fallbacks="default",
-        output_config={"effort": "medium"},
-        system=(
-            "Ты — внимательный личный финансовый и лайф-коуч. Пишешь по-русски, на «ты», тепло, "
-            "но конкретно: цифры, шаги, сроки. Текст для Telegram: без Markdown, "
-            "используй эмодзи и пустые строки между блоками. До 2500 символов."
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            system_instruction=(
+                "Ты — внимательный личный финансовый и лайф-коуч. Пишешь по-русски, на «ты», тепло, "
+                "но конкретно: цифры, шаги, сроки. Текст для Telegram: без Markdown, "
+                "используй эмодзи и пустые строки между блоками. До 2500 символов."
+            ),
         ),
-        messages=[{"role": "user", "content": prompt}],
     )
-    if response.stop_reason == "refusal":
-        return "Не получилось подготовить ответ 🙏 Попробуй ещё раз позже."
-    return _text_of(response.content)
+    return _text_of(_content_of(response)) or "Не получилось подготовить ответ 🙏 Попробуй ещё раз позже."
 
 
 def _avg_monthly_spending(db: DB, user_id: int, months: int = 3) -> dict:
@@ -246,27 +289,18 @@ async def weekly_checkin(db: DB, user_id: int) -> str | None:
         return None
     today = local_now().date()
     week_start = date.fromordinal(today.toordinal() - 6).isoformat()
-    response = await client.messages.create(
+    response = await client.aio.models.generate_content(
         model=CHAT_MODEL,
-        max_tokens=3000,
-        output_config={"effort": "low"},
-        system=SYSTEM,
-        messages=[
-            {
-                "role": "user",
-                "content": (
-                    f"[{stamp()}] Сейчас вечер воскресенья. Напиши мне короткое (3–5 строк) "
-                    "дружеское сообщение-чекин по моим целям: напомни о них, отметь прогресс, "
-                    "задай один вопрос, как прошла неделя.\n"
-                    f"Цели: {json.dumps([goal_view(g) for g in goals], ensure_ascii=False)}\n"
-                    f"Траты за неделю: {json.dumps(db.totals_by_category(user_id, week_start, today.isoformat()), ensure_ascii=False)}"
-                ),
-            }
-        ],
+        contents=(
+            f"[{stamp()}] Сейчас вечер воскресенья. Напиши мне короткое (3–5 строк) "
+            "дружеское сообщение-чекин по моим целям: напомни о них, отметь прогресс, "
+            "задай один вопрос, как прошла неделя.\n"
+            f"Цели: {json.dumps([goal_view(g) for g in goals], ensure_ascii=False)}\n"
+            f"Траты за неделю: {json.dumps(db.totals_by_category(user_id, week_start, today.isoformat()), ensure_ascii=False)}"
+        ),
+        config=types.GenerateContentConfig(system_instruction=SYSTEM),
     )
-    if response.stop_reason == "refusal":
-        return None
-    return _text_of(response.content) or None
+    return _text_of(_content_of(response)) or None
 
 
 # --- Чеки по фото ---
@@ -280,43 +314,24 @@ class ReceiptItem(BaseModel):
 
 class Receipt(BaseModel):
     is_receipt: bool
-    store: Optional[str]
-    date: Optional[str]
+    store: Optional[str] = None
+    date: Optional[str] = None
     items: list[ReceiptItem]
 
 
 async def parse_receipt(image: bytes, media_type: str = "image/jpeg") -> Receipt | None:
-    response = await client.messages.parse(
+    response = await client.aio.models.generate_content(
         model=CHAT_MODEL,
-        max_tokens=8000,
-        output_config={"effort": "low"},
-        output_format=Receipt,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": media_type,
-                            "data": base64.standard_b64encode(image).decode(),
-                        },
-                    },
-                    {
-                        "type": "text",
-                        "text": (
-                            "Это фото чека или скриншот оплаты? Если да — извлеки покупки. "
-                            "Объединяй похожие позиции одной категории в одну строку "
-                            "(например, все продукты — одна трата «продукты»), чтобы было 1–5 трат. "
-                            "amount — итоговая сумма с учётом скидок. date — дата чека YYYY-MM-DD, если видна. "
-                            "Если это не чек — is_receipt=false и пустой items."
-                        ),
-                    },
-                ],
-            }
+        contents=[
+            types.Part.from_bytes(data=image, mime_type=media_type),
+            (
+                "Это фото чека или скриншот оплаты? Если да — извлеки покупки. "
+                "Объединяй похожие позиции одной категории в одну строку "
+                "(например, все продукты — одна трата «продукты»), чтобы было 1–5 трат. "
+                "amount — итоговая сумма с учётом скидок. date — дата чека YYYY-MM-DD, если видна. "
+                "Если это не чек — is_receipt=false и пустой items."
+            ),
         ],
+        config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=Receipt),
     )
-    if response.stop_reason == "refusal":
-        return None
-    return response.parsed_output
+    return response.parsed if isinstance(response.parsed, Receipt) else None

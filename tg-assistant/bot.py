@@ -3,7 +3,6 @@ import logging
 from collections import defaultdict
 from datetime import datetime, timezone
 
-import anthropic
 from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import BotCommand, CallbackQuery, Message
@@ -11,7 +10,7 @@ from aiogram.utils.chat_action import ChatActionSender
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 import ai
-from config import ALLOWED_USERS, CURRENCY, TELEGRAM_TOKEN
+from config import ALLOWED_USERS, CURRENCY, GEMINI_API_KEY, TELEGRAM_TOKEN
 from db import DB
 from timeutil import local_now, month_range, next_occurrence, prev_month, utc_iso_to_local
 from tools import budget_warning, goal_view
@@ -48,7 +47,7 @@ HELP = f"""Привет! Я твой личный ИИ-помощник 🤖
 
 
 class AccessMiddleware(BaseMiddleware):
-    """Пускаем только своих, чтобы чужие не тратили твои деньги на API."""
+    """Пускаем только своих, чтобы чужие не съедали твой лимит запросов."""
 
     async def __call__(self, handler, event, data):
         user = event.from_user
@@ -83,18 +82,6 @@ async def send_long(bot: Bot, chat_id: int, text: str, **kwargs) -> None:
         chunks.append(current)
     for i, chunk in enumerate(chunks):
         await bot.send_message(chat_id, chunk, **(kwargs if i == len(chunks) - 1 else {}))
-
-
-def api_error_text(error: Exception) -> str:
-    if isinstance(error, anthropic.AuthenticationError):
-        return "Не могу достучаться до ИИ: неверный ANTHROPIC_API_KEY 🔑"
-    if isinstance(error, anthropic.RateLimitError):
-        return "ИИ сейчас перегружен запросами, попробуй через минутку ⏳"
-    if isinstance(error, anthropic.APIStatusError) and error.status_code == 400 and "credit" in str(error).lower():
-        return "На счёте Anthropic закончились деньги — пополни баланс в console.anthropic.com 💳"
-    if isinstance(error, anthropic.APIConnectionError):
-        return "Нет связи с ИИ, проверь интернет 🌐"
-    return "Что-то пошло не так 😵 Попробуй ещё раз."
 
 
 @dp.message(CommandStart())
@@ -189,9 +176,9 @@ async def on_plan(callback: CallbackQuery, bot: Bot):
     try:
         async with ChatActionSender.typing(bot=bot, chat_id=callback.message.chat.id):
             plan = await ai.goal_plan(db, user_id, goal_id)
-    except anthropic.APIError as e:
+    except ai.AIError as e:
         log.exception("plan failed")
-        plan = api_error_text(e)
+        plan = ai.error_text(e)
     await send_long(bot, callback.message.chat.id, plan)
 
 
@@ -201,9 +188,9 @@ async def cmd_report(message: Message, bot: Bot):
     try:
         async with ChatActionSender.typing(bot=bot, chat_id=message.chat.id):
             report = await ai.monthly_report(db, message.from_user.id, today.year, today.month)
-    except anthropic.APIError as e:
+    except ai.AIError as e:
         log.exception("report failed")
-        report = api_error_text(e)
+        report = ai.error_text(e)
     await send_long(bot, message.chat.id, report)
 
 
@@ -214,9 +201,9 @@ async def on_photo(message: Message, bot: Bot):
         async with ChatActionSender.typing(bot=bot, chat_id=message.chat.id):
             image = await bot.download(message.photo[-1].file_id)
             receipt = await ai.parse_receipt(image.read())
-    except anthropic.APIError as e:
+    except ai.AIError as e:
         log.exception("receipt failed")
-        await message.answer(api_error_text(e))
+        await message.answer(ai.error_text(e))
         return
     if not receipt or not receipt.is_receipt or not receipt.items:
         await message.answer("Не похоже на чек 🤔 Пришли фото чека или скриншот оплаты — я запишу траты.")
@@ -256,9 +243,9 @@ async def on_text(message: Message, bot: Bot):
     try:
         async with locks[user_id], ChatActionSender.typing(bot=bot, chat_id=message.chat.id):
             answer = await ai.chat(db, user_id, message.text)
-    except anthropic.APIError as e:
+    except ai.AIError as e:
         log.exception("chat failed")
-        answer = api_error_text(e)
+        answer = ai.error_text(e)
     await send_long(bot, message.chat.id, answer)
 
 
@@ -317,6 +304,8 @@ async def tick(bot: Bot) -> None:
 async def main() -> None:
     if not TELEGRAM_TOKEN:
         raise SystemExit("Не задан TELEGRAM_TOKEN — смотри README.md")
+    if not GEMINI_API_KEY:
+        raise SystemExit("Не задан GEMINI_API_KEY — смотри README.md")
     bot = Bot(TELEGRAM_TOKEN)
     await bot.set_my_commands(
         [
